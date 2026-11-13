@@ -609,15 +609,22 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
                 return 1;
             }
         }
-        let t = Instant::now();
-        match tm.transcribe(samples.clone()) {
-            Ok(out) => text = out,
+        let result = if args.stream {
+            replay_as_dictation(&tm, &samples)
+        } else {
+            let t = Instant::now();
+            tm.transcribe(samples.clone()).map(|out| (t.elapsed(), out))
+        };
+        match result {
+            Ok((elapsed, out)) => {
+                text = out;
+                times_ms.push(elapsed.as_millis() as u64);
+            }
             Err(e) => {
                 eprintln!("error: transcribe failed: {}", e);
                 return 1;
             }
         }
-        times_ms.push(t.elapsed().as_millis() as u64);
     }
     let best_ms = times_ms.iter().copied().min().unwrap_or(0);
     let rtf = if best_ms > 0 {
@@ -626,11 +633,13 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
         0.0
     };
 
+    let mode = if args.stream { "stream" } else { "batch" };
     if args.json {
         println!(
             "{}",
             serde_json::json!({
                 "model": model_id,
+                "mode": mode,
                 "requested_device": requested_device,
                 "bound_backend": bound_backend,
                 "audio_secs": audio_secs,
@@ -643,8 +652,9 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
         );
     } else {
         println!(
-            "model={} device={} backend={} audio={:.2}s load={}ms best={}ms rtf={:.2}x",
+            "model={} mode={} device={} backend={} audio={:.2}s load={}ms best={}ms rtf={:.2}x",
             model_id,
+            mode,
             requested_device,
             bound_backend.as_deref().unwrap_or("?"),
             audio_secs,
@@ -655,6 +665,48 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
         println!("text: {}", text);
     }
     0
+}
+
+/// Replays `samples` as a live dictation (see `--stream`). Returns the wait
+/// from the last sample to the final text, and that text.
+fn replay_as_dictation(
+    tm: &TranscriptionManager,
+    samples: &[f32],
+) -> anyhow::Result<(std::time::Duration, String)> {
+    use std::time::{Duration, Instant};
+    // One Silero VAD frame (32 ms at 16 kHz): the chunk the recorder feeds.
+    const FRAME: usize = 512;
+
+    // The previous run's stream worker clears itself just after replying, so
+    // a back-to-back start can find it still active: retry until it opens.
+    let router = tm.stream_router();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        tm.start_stream();
+        if router.is_open() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("the stream worker did not start");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let start = Instant::now();
+    let mut fed = 0;
+    for frame in samples.chunks(FRAME) {
+        // A frame reaches the decoder once it has been spoken.
+        fed += frame.len();
+        let due = start + Duration::from_secs_f64(fed as f64 / 16_000.0);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        router.feed(frame);
+    }
+
+    let released = Instant::now();
+    let out = tm.transcribe_recording(samples.to_vec())?;
+    Ok((released.elapsed(), out.text))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

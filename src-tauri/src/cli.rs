@@ -58,6 +58,14 @@ pub struct CliArgs {
     #[arg(long, value_name = "N")]
     pub repeat: Option<usize>,
 
+    /// Replay --transcribe-file as a live dictation: feed it to the streaming
+    /// decoder in real time, as the microphone would, then time the wait from
+    /// the last sample to the final text (what the user waits after releasing
+    /// the key). Models that don't stream are transcribed after the replay, as
+    /// in the app.
+    #[arg(long)]
+    pub stream: bool,
+
     /// Emit --transcribe-file results as JSON.
     #[arg(long)]
     pub json: bool,
